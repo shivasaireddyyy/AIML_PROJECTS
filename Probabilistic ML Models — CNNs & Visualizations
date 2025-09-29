@@ -1,0 +1,370 @@
+# ==============================================
+# Probabilistic ML Models — CNNs & Visualizations
+# ==============================================
+
+# Section A: Prereqs and Utilities
+# --------------------------------
+import os, time, warnings, ssl
+import numpy as np
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import optim
+import torchvision
+import torchvision.transforms as T
+from torch.utils.data import DataLoader, SubsetRandomSampler
+
+warnings.filterwarnings("ignore")
+
+# Device and reproducibility
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+seed = 0
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+
+print("Device:", device)
+
+# Helper: small plot utilities
+def imgrid(tensor, nrow=8, title=None, cmap=None):
+    grid = torchvision.utils.make_grid(tensor, nrow=nrow, padding=2, normalize=False)
+    npimg = grid.cpu().numpy()
+    plt.figure(figsize=(8, 4))
+    if tensor.shape[1] == 1:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)).squeeze(), cmap=cmap or 'gray')
+    else:
+        plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    if title:
+        plt.title(title)
+    plt.axis('off')
+    plt.show()
+
+# ------------------------------------------------------------------------------
+# Section B: Convolutional Operations (toy, self-contained)
+# ------------------------------------------------------------------------------
+# Generate a simple vertical-edge-like kernel of size k
+def generate_filter(k=3):
+    ker = np.ones((k, k), dtype=np.float32)
+    mid = k // 2
+    ker[:, mid] = 0
+    ker[:, mid+1:] *= -1
+    return ker
+
+# Apply Conv2d with specified kernel_size (via generated filter), padding, stride
+from torch.nn import Conv2d
+
+def apply_conv_numpy_gray(image_np, kernel_size=3, padding=0, stride=1):
+    # image_np: HxW uint8 or float32 grayscale
+    if image_np.dtype != np.float32:
+        image_np = image_np.astype(np.float32)
+    x = torch.from_numpy(image_np)[None, None, ...] / 255.0  # (1,1,H,W) in [0,1]
+
+    k = torch.from_numpy(generate_filter(kernel_size))  # (k,k)
+    k = k.view(1, 1, kernel_size, kernel_size)
+
+    conv = Conv2d(in_channels=1, out_channels=1, kernel_size=kernel_size,
+                  padding=padding, stride=stride, bias=False)
+    with torch.no_grad():
+        conv.weight.copy_(k)
+
+    with torch.no_grad():
+        y = conv(x).squeeze(0).squeeze(0).numpy()
+    return y
+
+# Quick synthetic image for demonstration (a white rectangle on black background)
+H, W = 128, 128
+toy = np.zeros((H, W), dtype=np.uint8)
+toy[:, 48:80] = 255  # vertical bright band
+
+# Show stride effect (downsampling) and padding (size change), kernel size (blurring)
+pad_demo = apply_conv_numpy_gray(toy, kernel_size=3, padding=4, stride=1)
+stride_demo = apply_conv_numpy_gray(toy, kernel_size=3, padding=0, stride=5)
+kernel_demo = apply_conv_numpy_gray(toy, kernel_size=15, padding=7, stride=1)
+
+plt.figure(figsize=(12,3))
+plt.subplot(1,3,1); plt.imshow(pad_demo, cmap='gray'); plt.title(f'Padding=4, shape={pad_demo.shape}'); plt.axis('off')
+plt.subplot(1,3,2); plt.imshow(stride_demo, cmap='gray'); plt.title(f'Stride=5, shape={stride_demo.shape}'); plt.axis('off')
+plt.subplot(1,3,3); plt.imshow(kernel_demo, cmap='gray'); plt.title(f'Kernel=15, shape={kernel_demo.shape}'); plt.axis('off')
+plt.show()
+# As padding increases, output spatial size increases; as stride increases, output size decreases; larger kernels blur/coarsen features [web:32].
+
+# ------------------------------------------------------------------------------
+# Section C: CNN on MNIST — using learned representations
+# ------------------------------------------------------------------------------
+# MNIST download mirrors: many environments fallback to ossci S3; ensure mirror if needed
+# If encountering 404/403 on LeCun site, torchvision falls back to ossci-datasets S3 automatically in modern versions; patch if needed [web:27][web:26].
+from torchvision import datasets
+
+# Optional hotfix for stubborn environments:
+try:
+    datasets.MNIST.resources = [
+        ('https://ossci-datasets.s3.amazonaws.com/mnist/train-images-idx3-ubyte.gz',
+         'f68b3c2dcbeaaa9fbdd348bbdeb94873'),
+        ('https://ossci-datasets.s3.amazonaws.com/mnist/train-labels-idx1-ubyte.gz',
+         'd53e105ee54ea40749a09fcbcd1e9432'),
+        ('https://ossci-datasets.s3.amazonaws.com/mnist/t10k-images-idx3-ubyte.gz',
+         '9fb629c4189551a2d022fa330f9573f3'),
+        ('https://ossci-datasets.s3.amazonaws.com/mnist/t10k-labels-idx1-ubyte.gz',
+         'ec29112dd5afa0611ce80d1b7f02629c')
+    ]
+except Exception:
+    pass
+# Modern torchvision usually handles this fallback; issue threads document older mirror problems [web:27][web:26][web:33].
+
+# Dataloaders
+batch_size = 128
+tf_mnist = T.ToTensor()
+
+train_data = datasets.MNIST(root='./data', train=True, download=True, transform=tf_mnist)
+test_data  = datasets.MNIST(root='./data', train=False, download=True, transform=tf_mnist)
+
+train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
+test_loader  = DataLoader(test_data, batch_size=batch_size, shuffle=False)
+
+print('Train shape:', train_data.data.shape, 'Test shape:', test_data.data.shape)
+print('Classes:', list(range(10)))
+
+# Visualize a few digits
+imgs = train_data.data[:20].unsqueeze(1).float()/255.0
+imgrid(imgs, nrow=10, title='MNIST samples', cmap='gray')
+
+# Define a simple CNN aligned with the provided architecture
+class CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, stride=1, padding=1)
+        self.pool1 = nn.MaxPool2d(2,2)
+        self.conv2 = nn.Conv2d(32, 64, 3, stride=1, padding=1)
+        self.pool2 = nn.MaxPool2d(2,2)
+        self.fc    = nn.Linear(64*7*7, 128)
+        self.out   = nn.Linear(128, 10)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x)); x = self.pool1(x)
+        x = F.relu(self.conv2(x)); x = self.pool2(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc(x))
+        return self.out(x)
+
+model = CNN().to(device)
+print(model)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model.parameters(), lr=0.01)
+
+def train_epoch(model, loader, criterion, optimizer):
+    model.train()
+    run_loss, correct, n = 0.0, 0, 0
+    for x,y in loader:
+        x,y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        run_loss += loss.item()*x.size(0)
+        correct  += (logits.argmax(1)==y).sum().item()
+        n += x.size(0)
+    return run_loss/n, correct/n
+
+def eval_epoch(model, loader, criterion):
+    model.eval()
+    run_loss, correct, n = 0.0, 0, 0
+    with torch.no_grad():
+        for x,y in loader:
+            x,y = x.to(device), y.to(device)
+            logits = model(x)
+            loss = criterion(logits, y)
+            run_loss += loss.item()*x.size(0)
+            correct  += (logits.argmax(1)==y).sum().item()
+            n += x.size(0)
+    return run_loss/n, correct/n
+
+num_epochs = 10
+train_losses, train_accs = [], []
+for epoch in range(num_epochs):
+    tl, ta = train_epoch(model, train_loader, criterion, optimizer)
+    vl, va = eval_epoch(model, test_loader, criterion)
+    train_losses.append(tl); train_accs.append(ta)
+    print(f"Epoch {epoch+1}/{num_epochs} | Train Loss {tl:.4f} Acc {ta*100:.2f}% | Test Acc {va*100:.2f}%")
+# This follows standard MNIST CNN training; mirror fallback behavior documented in issues [web:27][web:26].
+
+# ------------------------------------------------------------------------------
+# Section D: Visualizing CNN filters and feature maps
+# ------------------------------------------------------------------------------
+# Save conv layers and weights
+model_weights = []
+conv_layers = []
+for m in model.modules():
+    if isinstance(m, nn.Conv2d):
+        conv_layers.append(m)
+        model_weights.append(m.weight.data.clone().cpu())
+
+print("Total convolutional layers:", len(conv_layers))
+for c, w in zip(conv_layers, model_weights):
+    print("Layer:", c, "Weight shape:", tuple(w.shape))
+# Methods for visualizing filters and feature maps are common in tutorials [web:35][web:32].
+
+# Visualize first conv layer filters (as images)
+w0 = model_weights[0]  # shape [32,1,3,3]
+plt.figure(figsize=(10,10))
+for i in range(min(32, w0.shape[0])):
+    plt.subplot(6,6,i+1)
+    plt.imshow(w0[i,0].numpy(), cmap='gray')
+    plt.axis('off')
+plt.suptitle('Conv1 filters')
+plt.show()
+
+# Feature maps: run a test image through conv layers
+x_sample, _ = next(iter(test_loader))
+x_img = x_sample[0:1].to(device)  # one image
+with torch.no_grad():
+    feat1 = F.relu(model.conv1(x_img))
+    feat1p = model.pool1(feat1)
+    feat2 = F.relu(model.conv2(feat1p))
+    feat2p = model.pool2(feat2)
+
+# Visualize feature maps of conv1
+fmap = feat1.squeeze(0).cpu()  # [32,28,28]
+plt.figure(figsize=(10,10))
+for i in range(min(32, fmap.shape[0])):
+    plt.subplot(6,6,i+1)
+    plt.imshow(fmap[i], cmap='gray')
+    plt.axis('off')
+plt.suptitle('Conv1 feature maps')
+plt.show()
+# Similar steps are used widely for feature-map introspection in PyTorch [web:35][web:32].
+
+# ------------------------------------------------------------------------------
+# Section E: Pooling demo (Max vs Avg) on a small matrix
+# ------------------------------------------------------------------------------
+from torch.nn import MaxPool2d, AvgPool2d
+img_small = np.array([
+    [2,0,0,1,6,0,5,3],
+    [0,6,5,9,1,5,8,0],
+    [0,6,0,1,2,3,4,4],
+    [7,0,3,1,4,2,0,1],
+    [3,7,0,5,6,0,5,0],
+    [0,4,6,1,1,0,0,1],
+    [3,5,0,2,2,0,9,0],
+    [1,0,3,1,7,0,0,0]
+], dtype=np.float32)
+x_small = torch.from_numpy(img_small)[None,None,...]
+maxp = MaxPool2d(4,4)(x_small).squeeze().numpy()
+avgp = AvgPool2d(4,4)(x_small).squeeze().numpy()
+print("Max Pool 4x4:\n", maxp, "\n")
+print("Avg Pool 4x4:\n", avgp, "\n")
+# Max/Avg pooling usage aligns with PyTorch docs; many guides compare these operations [web:32].
+
+# ------------------------------------------------------------------------------
+# Section F: Transfer Learning on German Traffic Signs
+# ------------------------------------------------------------------------------
+# Expect dataset at: german_traffic_signs_dataset/{Train,Test}/<class folders>
+# If using Colab, you may need to download/unzip first externally.
+transform = T.Compose([
+    T.Resize((224,224)),
+    T.GaussianBlur(3),
+    T.RandomAffine(0, translate=(0.3,0.3), shear=5),
+    T.ToTensor(),
+    T.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+])
+
+from torchvision.datasets import ImageFolder
+trainset = ImageFolder('german_traffic_signs_dataset/Train', transform=transform)
+testset  = ImageFolder('german_traffic_signs_dataset/Test',  transform=transform)
+
+val_split = 0.2
+indices = np.arange(len(trainset))
+np.random.shuffle(indices)
+cut = int((1-val_split)*len(trainset))
+train_loader = DataLoader(trainset, batch_size=64, shuffle=False,
+                          sampler=SubsetRandomSampler(indices[:cut]), num_workers=2)
+val_loader   = DataLoader(trainset, batch_size=64, shuffle=False,
+                          sampler=SubsetRandomSampler(indices[cut:]), num_workers=2)
+test_loader2 = DataLoader(testset,  batch_size=64, shuffle=False, num_workers=2)
+
+dataloaders = {'train': train_loader, 'val': val_loader}
+dataset_sizes = {'train': cut, 'val': len(trainset)-cut}
+print('Train/Val/Test:', dataset_sizes['train'], dataset_sizes['val'], len(testset))
+print('Classes:', len(trainset.classes))
+
+def train_model(model, criterion, optimizer, dataloaders, dataset_sizes, num_epochs=6):
+    best_acc = 0.0
+    hist = ([], [], [], [])
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch}/{num_epochs-1}\n----------")
+        for phase in ['train','val']:
+            if phase=='train': model.train()
+            else: model.eval()
+            run_loss, correct, n = 0.0, 0, 0
+            for x,y in dataloaders[phase]:
+                x,y = x.to(device), y.to(device)
+                optimizer.zero_grad()
+                with torch.set_grad_enabled(phase=='train'):
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                    if phase=='train':
+                        loss.backward()
+                        optimizer.step()
+                run_loss += loss.item()*x.size(0)
+                correct  += (logits.argmax(1)==y).sum().item()
+                n += x.size(0)
+            eloss = run_loss/dataset_sizes[phase]
+            eacc  = correct/dataset_sizes[phase]
+            if phase=='train':
+                hist[0].append(eloss); hist[2].append(eacc)
+            else:
+                hist[1].append(eloss); hist[3].append(eacc)
+            print(f"{phase} Loss: {eloss:.4f} Acc: {eacc*100:.2f}")
+            if phase=='val' and eacc>best_acc: best_acc=eacc
+        print()
+    print("Best val Acc:", best_acc*100)
+    return hist
+
+def test_model(model, loader):
+    model.eval()
+    correct, n = 0, 0
+    with torch.no_grad():
+        for x,y in loader:
+            x,y = x.to(device), y.to(device)
+            logits = model(x)
+            correct += (logits.argmax(1)==y).sum().item()
+            n += x.size(0)
+    print("Test Accuracy: {:.2f}".format(100*correct/n))
+
+# Fine-tuning: load pretrained ResNet18 and replace classifier
+from torchvision.models import resnet18, ResNet18_Weights
+model_ft = resnet18(weights=ResNet18_Weights.DEFAULT)  # modern weights API [web:31][web:34]
+model_ft.fc = nn.Linear(model_ft.fc.in_features, len(trainset.classes))
+model_ft = model_ft.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.SGD(model_ft.parameters(), lr=0.001, momentum=0.9)
+
+print("Before training (fine-tune):")
+test_model(model_ft, test_loader2)
+hist = train_model(model_ft, criterion, optimizer, dataloaders, dataset_sizes, num_epochs=6)
+print("After training (fine-tune):")
+test_model(model_ft, test_loader2)
+# The modern API deprecates pretrained=True; weights enum is preferred [web:34][web:31].
+
+# Feature extraction: freeze backbone, train only final layer
+model_fx = resnet18(weights=ResNet18_Weights.DEFAULT)
+for p in model_fx.parameters():
+    p.requires_grad = False
+model_fx.fc = nn.Linear(model_fx.fc.in_features, len(trainset.classes))
+model_fx = model_fx.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer_fc = optim.SGD(model_fx.fc.parameters(), lr=0.01, momentum=0.9)
+
+print("Before training (feature extraction):")
+test_model(model_fx, test_loader2)
+hist2 = train_model(model_fx, criterion, optimizer_fc, dataloaders, dataset_sizes, num_epochs=5)
+print("After training (feature extraction):")
+test_model(model_fx, test_loader2)
+# Fine-tuning often outperforms feature extraction when the new task is similar to ImageNet and data is moderately sufficient; weights API reference provided [web:34][web:31].
