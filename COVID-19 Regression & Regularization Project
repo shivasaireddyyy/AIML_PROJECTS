@@ -1,0 +1,280 @@
+# ============================================
+# COVID-19 Regression & Regularization Project
+# ============================================
+
+# ---- Imports
+import pandas as pd
+import numpy as np
+
+import matplotlib.pyplot as plt
+plt.style.use('ggplot')
+from matplotlib.pylab import rcParams
+rcParams['figure.figsize'] = 10, 6
+
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LinearRegression, BayesianRidge
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+# -------------------------
+# 1) Load data
+# -------------------------
+# Source from the assignment repository (public, raw CSV)
+path = "https://raw.githubusercontent.com/PranavTadimeti/Regression_Project/main/covid_19_data.csv"
+df_orig = pd.read_csv(path)
+
+# -------------------------
+# 2) Build daily aggregates
+# -------------------------
+# - Drop unused column
+# - Convert date to datetime
+# - Aggregate global totals per day
+df = df_orig.copy()
+if 'Last Update' in df.columns:
+    df = df.drop(columns=['Last Update'])
+
+# Ensure consistent date parsing with known format
+df['ObservationDate'] = pd.to_datetime(df['ObservationDate'], format='%m/%d/%Y')
+
+# Sum totals per date and sort chronologically
+daily = (
+    df.groupby('ObservationDate')[['Confirmed', 'Deaths', 'Recovered']]
+      .sum()
+      .sort_index()
+)
+
+# Create Closed and Active case columns
+daily['Closed Cases'] = daily['Deaths'] + daily['Recovered']
+daily['Active Cases'] = daily['Confirmed'] - daily['Closed Cases']
+
+# Add a numeric time axis "Days Since"
+daily['Days Since'] = (daily.index - daily.index.min()).days
+
+# Reorder columns for convenience
+daily = daily[['Days Since', 'Confirmed', 'Deaths', 'Recovered', 'Active Cases', 'Closed Cases']]
+
+# -------------------------
+# 3) Plots: totals over time
+# -------------------------
+plt.figure(figsize=(15, 5))
+plt.plot(daily.index, daily['Confirmed'], label="Confirmed")
+plt.plot(daily.index, daily['Deaths'], label="Deaths")
+plt.plot(daily.index, daily['Recovered'], label="Recovered")
+plt.legend()
+plt.xlabel("Date")
+plt.ylabel("Count")
+plt.title(f"Total Cases, Deaths, and Recoveries: {daily.index.min().date()} - {daily.index.max().date()}")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 4) Plot: Active vs Closed
+# -------------------------
+plt.figure(figsize=(15, 5))
+plt.plot(daily.index, daily['Active Cases'], label="Active Cases")
+plt.plot(daily.index, daily['Closed Cases'], label="Closed Cases")
+plt.legend()
+plt.xlabel("Date")
+plt.ylabel("Count")
+plt.title(f"Active vs Closed Cases: {daily.index.min().date()} - {daily.index.max().date()}")
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 5) Growth Factor computation
+# -------------------------
+# Define a safe growth factor: GF_t = value_t / value_{t-1}; undefined if denom = 0
+def growth(series_np):
+    prev = series_np[:-1]
+    cur  = series_np[1:]
+    gf = np.divide(cur, prev, out=np.full_like(cur, np.nan, dtype=float), where=prev != 0)
+    return gf
+
+confirmed_np = daily['Confirmed'].to_numpy(dtype=float)
+deaths_np    = daily['Deaths'].to_numpy(dtype=float)
+recovered_np = daily['Recovered'].to_numpy(dtype=float)
+
+confGF  = growth(confirmed_np)
+deathGF = growth(deaths_np)
+recGF   = growth(recovered_np)
+
+# Plot growth factors vs days (align x to start at day 1 since GF is between consecutive days)
+plt.figure(figsize=(15, 5))
+plt.plot(daily['Days Since'].to_numpy()[1:], confGF,  label="GF Confirmed")
+plt.plot(daily['Days Since'].to_numpy()[1:], deathGF, label="GF Deaths")
+plt.plot(daily['Days Since'].to_numpy()[1:], recGF,   label="GF Recovered")
+plt.plot(daily['Days Since'].to_numpy()[1:], np.ones_like(confGF), label="GF = 1.0", linestyle='--')
+plt.legend()
+plt.xlabel("Days Since (starting at 1 for GF)")
+plt.ylabel("Growth Ratio")
+plt.ylim(0.5, 2.0)
+plt.title("Growth Factors of Confirmed, Deaths, and Recoveries")
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 6) Prepare features/targets
+# -------------------------
+# Target: global Confirmed
+X = daily[['Days Since']].to_numpy()
+y = daily['Confirmed'].to_numpy()
+
+# Time-ordered split: earliest 85% train, latest 15% test
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.15, shuffle=False
+)
+
+# -------------------------
+# 7) Linear Regression (baseline)
+# -------------------------
+lin = LinearRegression(fit_intercept=False)  # consistent with day-0 origin modeling
+lin.fit(X_train, y_train)
+y_pred_test_lin = lin.predict(X_test)
+y_pred_all_lin  = lin.predict(X)
+
+print("Linear Regression")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_lin))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_lin))
+
+# Plot test window predictions vs actual
+plt.figure(figsize=(15, 5))
+plt.plot(X_test.ravel(), y_test, label="Actual (Test)")
+plt.plot(X_test.ravel(), y_pred_test_lin, label="Predicted (Linear)")
+plt.xlabel("Days Since")
+plt.ylabel("Confirmed")
+plt.title("Linear Regression: Test Window")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 8) Polynomial Regression (OLS)
+# -------------------------
+# Degree can be tuned; start with 5 as in the assignment
+poly = PolynomialFeatures(degree=5, include_bias=False)
+X_train_poly = poly.fit_transform(X_train)  # fit on train to avoid leakage
+X_test_poly  = poly.transform(X_test)
+X_all_poly   = poly.transform(X)
+
+lin_poly = LinearRegression(fit_intercept=False)
+lin_poly.fit(X_train_poly, y_train)
+y_pred_test_poly = lin_poly.predict(X_test_poly)
+y_pred_all_poly  = lin_poly.predict(X_all_poly)
+
+print("Polynomial Regression (degree=5, OLS)")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_poly))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_poly))
+
+# Plot test window predictions vs actual
+plt.figure(figsize=(15, 5))
+plt.plot(X_test.ravel(), y_test, label="Actual (Test)")
+plt.plot(X_test.ravel(), y_pred_test_poly, label="Predicted (Poly OLS)")
+plt.xlabel("Days Since")
+plt.ylabel("Confirmed")
+plt.title("Polynomial Regression (OLS): Test Window")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 9) Bayesian Ridge (ridge-like) on raw X
+# -------------------------
+# Hyperparameter search space from assignment; these are priors for noise/weights (Gamma)
+param_grid = {
+    'tol':      [1e-4, 1e-3, 1e-2],
+    'alpha_1':  [1e-7, 1e-6, 1e-5, 1e-4],
+    'alpha_2':  [1e-7, 1e-6, 1e-5, 1e-4],
+    'lambda_1': [1e-7, 1e-6, 1e-5, 1e-4],
+    'lambda_2': [1e-7, 1e-6, 1e-5, 1e-4],
+}
+
+bayes = BayesianRidge(fit_intercept=False)
+search = RandomizedSearchCV(
+    bayes, param_grid, n_iter=40, cv=3,
+    scoring='neg_mean_squared_error', n_jobs=-1, verbose=1, return_train_score=True
+)
+search.fit(X_train, y_train)
+
+y_pred_test_brr = search.predict(X_test)
+y_pred_all_brr  = search.predict(X)
+
+print("Bayesian Ridge (raw X)")
+print("  Best params:", search.best_params_)
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_brr))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_brr))
+
+plt.figure(figsize=(15, 5))
+plt.plot(X_test.ravel(), y_test, label="Actual (Test)")
+plt.plot(X_test.ravel(), y_pred_test_brr, label="Predicted (Bayes Ridge)")
+plt.xlabel("Days Since")
+plt.ylabel("Confirmed")
+plt.title("Bayesian Ridge (raw X): Test Window")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 10) Bayesian Ridge on Polynomial Features
+# -------------------------
+search_poly = RandomizedSearchCV(
+    BayesianRidge(fit_intercept=False),
+    param_grid, n_iter=40, cv=3,
+    scoring='neg_mean_squared_error', n_jobs=-1, verbose=1, return_train_score=True
+)
+search_poly.fit(X_train_poly, y_train)
+
+y_pred_test_brr_poly = search_poly.predict(X_test_poly)
+y_pred_all_brr_poly  = search_poly.predict(X_all_poly)
+
+print("Bayesian Ridge (Polynomial Features, degree=5)")
+print("  Best params:", search_poly.best_params_)
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_brr_poly))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_brr_poly))
+
+plt.figure(figsize=(15, 5))
+plt.plot(X_test.ravel(), y_test, label="Actual (Test)")
+plt.plot(X_test.ravel(), y_pred_test_brr_poly, label="Predicted (Bayes Ridge Poly)")
+plt.xlabel("Days Since")
+plt.ylabel("Confirmed")
+plt.title("Bayesian Ridge on Polynomial Features: Test Window")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 11) Side-by-side full-range visualization
+# -------------------------
+plt.figure(figsize=(15, 6))
+plt.plot(X.ravel(), y, label='Actual (All)')
+plt.plot(X.ravel(), y_pred_all_lin,       label='Linear (All)', linestyle='--')
+plt.plot(X.ravel(), y_pred_all_poly,      label='Poly OLS (All)', linestyle='--')
+plt.plot(X.ravel(), y_pred_all_brr,       label='Bayes Ridge (All)', linestyle='--')
+plt.plot(X.ravel(), y_pred_all_brr_poly,  label='Bayes Ridge Poly (All)', linestyle='--')
+plt.xlabel('Days Since')
+plt.ylabel('# Confirmed Cases')
+plt.title('Model Fits Over Full Range')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 12) Final comparison printout
+# -------------------------
+print("\n=== Summary (Test Window) ===")
+print("Linear:")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_lin))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_lin))
+
+print("Polynomial OLS (deg=5):")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_poly))			
+print("  MSE:", mean_squared_error(y_test, y_pred_test_poly))
+
+print("Bayesian Ridge (raw X):")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_brr))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_brr))
+
+print("Bayesian Ridge + Poly (deg=5):")
+print("  MAE:", mean_absolute_error(y_test, y_pred_test_brr_poly))
+print("  MSE:", mean_squared_error(y_test, y_pred_test_brr_poly))
