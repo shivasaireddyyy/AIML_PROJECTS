@@ -1,0 +1,218 @@
+# ============================================
+# Linear Regression, MSE/RMSE, Polynomial Regression, California Housing
+# ============================================
+
+# ---- Imports and setup ----
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
+
+from sklearn import linear_model, metrics
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.model_selection import train_test_split
+
+import warnings
+warnings.filterwarnings('ignore')
+
+plt.style.use('ggplot')
+plt.rcParams['figure.figsize'] = (10, 8)
+
+# For reproducibility
+SEED = 42
+np.random.seed(SEED)
+
+# ============================================
+# Section 1: Linear regression on synthetic linear data
+# ============================================
+
+# Generate synthetic linear data: y = 3x + noise
+x = np.linspace(0, 100, 100).reshape(-1, 1)
+y = (np.random.rand(100) * 25).astype(int).reshape(-1, 1) + 3 * x
+
+# Visualize raw points
+plt.title("Synthetic linear data")
+plt.scatter(x, y, color="blue", alpha=0.7)
+plt.legend(["actual data points"])
+plt.show()
+
+# Split into train/test
+x_train, x_test, y_train, y_test = train_test_split(
+    x, y, test_size=0.2, random_state=SEED
+)
+
+# Train linear regression (least squares minimizes MSE)
+lin = linear_model.LinearRegression()
+lin.fit(x_train, y_train)
+
+# Model parameters (slope = coef, intercept = bias)
+coef, intercept = lin.coef_[0][0], lin.intercept_[0]
+print(f"[Linear] Coefficient m: {coef:.3f}, Intercept c: {intercept:.3f}")
+
+# Predictions and RMSE on the test set
+y_pred_test = lin.predict(x_test)
+rmse_test = np.sqrt(metrics.mean_squared_error(y_test, y_pred_test))
+print(f"[Linear] Test RMSE: {rmse_test:.3f}")
+
+# Plot fit on test subset for visualization
+order = np.argsort(x_test[:, 0])
+plt.title("Linear regression: actual vs predicted (test)")
+plt.scatter(x, y, color="blue", alpha=0.45)
+plt.plot(x_test[order], y_pred_test[order], color="red", linewidth=2)
+plt.legend(["predicted line", "actual data points"])
+plt.show()
+
+# Note:
+# - LinearRegression solves least squares; training minimizes MSE.
+# - RMSE = sqrt(MSE) keeps units of the target for interpretability.
+# References: MSE/RMSE usage and definitions [web:28][web:26].
+
+# ============================================
+# Section 2: Linear vs Polynomial on non-linear data
+# ============================================
+
+# Create quadratic ground-truth data with noise: y = 3x^2 + noise
+x2 = np.linspace(0, 100, 100).reshape(-1, 1)
+y2 = (np.random.randint(-1000, 1000, x2.shape[0]).reshape(-1, 1)).astype(int) + 3 * (x2 ** 2)
+
+# 2.1 Linear fit (will underfit quadratic data)
+lin2 = linear_model.LinearRegression()
+lin2.fit(x2, y2)
+y2_lin_pred = lin2.predict(x2)
+rmse_lin2 = np.sqrt(metrics.mean_squared_error(y2, y2_lin_pred))
+print(f"[Quadratic data] Linear fit RMSE: {rmse_lin2:.3f}")
+
+plt.title("Linear fit on quadratic data (underfitting)")
+plt.scatter(x2, y2, color="blue", s=10, alpha=0.6)
+plt.plot(x2, y2_lin_pred, color="red", linewidth=2)
+plt.legend(["linear prediction", "actual"])
+plt.show()
+
+# 2.2 Polynomial regression helper
+def poly_regression(x_raw, y_raw, deg, label=""):
+    """
+    Fit PolynomialFeatures(deg) + LinearRegression on (x_raw, y_raw)
+    and plot prediction. Returns RMSE on the training data.
+    """
+    x_raw = np.asarray(x_raw).reshape(-1, 1)
+    y_raw = np.asarray(y_raw).reshape(-1, 1)
+
+    # Create polynomial design matrix: [1, x, x^2, ..., x^deg]
+    poly = PolynomialFeatures(degree=deg, include_bias=True)
+    Xp = poly.fit_transform(x_raw)  # expands features up to 'deg' [web:1]
+
+    # Fit linear regression on polynomial features
+    lr = linear_model.LinearRegression()
+    lr.fit(Xp, y_raw)
+
+    # In-sample predictions and RMSE
+    yhat = lr.predict(Xp)
+    rmse = np.sqrt(metrics.mean_squared_error(y_raw, yhat))
+
+    # Plot sorted for a clean curve
+    order = np.argsort(x_raw[:, 0])
+    plt.title(f"Polynomial regression (degree={deg}) {label}".strip())
+    plt.scatter(x_raw, y_raw, color="blue", s=10, alpha=0.6)
+    plt.plot(x_raw[order], yhat[order], color="red", linewidth=2)
+    plt.legend(["predicted polynomial", "actual"])
+    plt.show()
+
+    print(f"[Polynomial deg={deg}] RMSE: {rmse:.3f}")
+    return rmse
+
+# Fit with degree=2 (should capture quadratic trend)
+poly_regression(x2, y2, deg=2, label="on quadratic data")
+
+# Notes:
+# - PolynomialFeatures maps x -> [1, x, x^2, ..., x^d], enabling a linear
+#   model in these features to represent non-linear curves in x [web:1].
+# - Model capacity vs true complexity: too low = underfit; too high = risk overfit [web:3].
+
+# ============================================
+# Section 3: Overfitting demo on noisy sine
+# ============================================
+
+def sine_overfit_demo(deg):
+    """
+    Generate noisy sine data, fit polynomial of given degree,
+    and visualize the fit to illustrate potential overfitting.
+    """
+    np.random.seed(SEED)
+    Xs = np.array([i * np.pi / 180 for i in range(60, 300, 6)]).reshape(-1, 1)
+    ys = np.sin(Xs) + np.random.normal(0, 0.15, len(Xs)).reshape(-1, 1)
+    poly_regression(Xs, ys, deg=deg, label="on noisy sine")
+
+# Try several degrees to see effect: low vs high capacity
+sine_overfit_demo(4)
+sine_overfit_demo(12)
+
+# Notes:
+# - Training error decreases with degree, but validation/test error typically
+#   forms a U-shape: decreases then increases as the model starts fitting noise (overfitting) [web:3].
+# - Use a validation split or cross-validation to select degree that minimizes validation error [web:3].
+
+# ============================================
+# Section 4: California Housing — simple linear model with median_income
+# ============================================
+
+# Load dataset (Ageron's repo CSV used widely for the MOOC)
+df = pd.read_csv("https://raw.githubusercontent.com/ageron/handson-ml/master/datasets/housing/housing.csv")
+df['MEDV'] = df['median_house_value']  # alias target name
+
+# Remove non-numeric column for correlation visualization
+df_num = df.drop(columns=['ocean_proximity'])
+
+# 4.1 Target distribution
+sns.set(rc={'figure.figsize': (11, 8)})
+sns.histplot(df_num['MEDV'], bins=30, kde=True)
+plt.title("MEDV (median house value) distribution")
+plt.show()
+
+# 4.2 Correlation heatmap (numeric only)
+corr = df_num.corr(numeric_only=True).round(2)
+plt.title("Correlation heatmap (numeric features)")
+sns.heatmap(corr, annot=True, cmap="coolwarm", vmin=-1, vmax=1)
+plt.show()
+
+# 4.3 Scatter with median_income (commonly strongest simple linear signal)
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.scatter(df['median_income'], df_num['MEDV'], s=10, alpha=0.5)
+plt.xlabel("median_income")
+plt.ylabel("MEDV")
+plt.title("Median income vs MEDV")
+plt.subplot(1, 2, 2)
+sns.regplot(x='median_income', y='MEDV', data=df, scatter_kws={'s': 10, 'alpha': 0.5}, line_kws={'color': 'red'})
+plt.title("Linear trend")
+plt.tight_layout()
+plt.show()
+
+# 4.4 Simple one-feature linear regression baseline
+X = df[['median_income']].values
+y = df_num['MEDV'].values
+
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, random_state=SEED)
+lm = linear_model.LinearRegression()
+lm.fit(X_tr, y_tr)
+
+y_tr_pred = lm.predict(X_tr)
+y_te_pred = lm.predict(X_te)
+
+rmse_tr = np.sqrt(metrics.mean_squared_error(y_tr, y_tr_pred))
+rmse_te = np.sqrt(metrics.mean_squared_error(y_te, y_te_pred))
+r2_tr = metrics.r2_score(y_tr, y_tr_pred)
+r2_te = metrics.r2_score(y_te, y_te_pred)
+
+print("=== California Housing: median_income -> MEDV ===")
+print(f"Training: RMSE {rmse_tr:.2f}, R2 {r2_tr:.3f}")
+print(f"Testing:  RMSE {rmse_te:.2f}, R2 {r2_te:.3f}")
+
+# Tips:
+# - PolynomialFeatures can create many large-magnitude terms for high degrees;
+#   consider scaling and regularization to reduce overfitting/instability [web:1].
+# - Diagnose overfitting by tracking train vs validation MSE across degrees
+#   and choose degree via validation or cross-validation [web:3].
+
+# ============================================
+# End of script
+# ============================================
